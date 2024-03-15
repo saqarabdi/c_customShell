@@ -1,0 +1,231 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h> //For error handling
+#define MAX_ARGS 100
+#define MAX_LINE 1024
+#define MAX_HISTORY 100
+
+//Global variables and function declarations
+char history[MAX_HISTORY][MAX_LINE];
+int history_index = 0;
+void add_history(char *line);
+void print_history();
+void clear_history();
+int execute_command(char **args, int arg_count);//Declaration of execute_commands
+int execute_piped_commands(char **commands, int num_commands);//Declaration of execute_piped_commands
+
+
+//Implementation of functions
+void add_history(char *line) {
+    strcpy(history[history_index % MAX_HISTORY], line);
+    history_index++;
+}
+
+void print_history() {
+    for (int i = 0; i < history_index; i++) {
+        printf("%d  %s", i % MAX_HISTORY, history[i % MAX_HISTORY]);
+    }
+}
+
+void clear_history() {
+    for (int i = 0; i < MAX_HISTORY; i++) {
+        history[i][0] = '\0';  // Clear each history entry
+    }
+    history_index = 0;
+}
+
+int execute_command(char **args, int arg_count);
+
+int execute_history(int offset) {
+    if (offset < 0 || offset >= MAX_HISTORY || history[offset % MAX_HISTORY][0] == '\0') {
+        printf("Invalid history offset\n");
+        return 1;
+    }
+
+    char *args[MAX_ARGS];
+    int arg_count = 0;
+    args[arg_count++] = strtok(history[offset % MAX_HISTORY], " ");
+    while ((args[arg_count++] = strtok(NULL, " ")) != NULL) {
+        if (arg_count >= MAX_ARGS) {
+            fprintf(stderr, "Too many arguments\n");
+            arg_count--;
+            break;
+        }
+    }
+
+    return execute_command(args, arg_count);  // Reuse execute_command function
+}
+
+int execute_command(char **args, int arg_count) {
+    if (strcmp(args[0], "exit") == 0) {
+        exit(0);
+    } else if (strcmp(args[0], "cd") == 0) {
+        if (arg_count != 2) {
+            fprintf(stderr, "cd: invalid number of arguments\n");
+        } else {
+            if (chdir(args[1]) != 0) {
+                perror("cd");
+            }
+        }
+    } else if (strcmp(args[0], "history") == 0) {
+        if (arg_count == 1) {
+            print_history();
+        } else if (strcmp(args[1], "-c") == 0) {
+            clear_history();
+        } else {
+            int offset = atoi(args[1]);
+            return execute_history(offset);
+        }
+    } else {
+        // Execute external command using fork and execvp
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+        } else if (pid == 0) {
+            // Child process
+            if (execvp(args[0], args) < 0) {
+                perror("execvp");
+                exit(1);
+            }
+        } else {
+            // Parent process
+            wait(NULL);  // Wait for child to finish
+        }
+    }
+
+    return 0;
+}
+  int execute_piped_commands(char **commands, int num_commands) {
+    int in_fd = STDIN_FILENO; // The input for the first command is standard input
+
+    // Loop through each command in the pipeline
+    for (int i = 0; i < num_commands; i++) {
+        int fd[2]; // Temporary storage for a single pipe
+
+        // Only create a pipe if there is a next command
+        if (i < num_commands - 1) {
+            if (pipe(fd) == -1) {
+                perror("pipe failed");
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        pid_t pid = fork();
+        if (pid == -1) {
+            perror("fork failed");
+            exit(EXIT_FAILURE);
+        } else if (pid == 0) { // Child process
+            // Redirect input from the previous iteration's pipe
+            if (in_fd != STDIN_FILENO) {
+                if (dup2(in_fd, STDIN_FILENO) == -1) {
+                    perror("dup2 for stdin failed");
+                    exit(EXIT_FAILURE);
+                }
+                close(in_fd); // Close this descriptor since it's now duplicated
+            }
+
+            // For all but the last command, set up the output redirection
+            if (i < num_commands - 1) {
+                close(fd[0]); // Close the read end; not needed in the child
+                if (dup2(fd[1], STDOUT_FILENO) == -1) {
+                    perror("dup2 for stdout failed");
+                    exit(EXIT_FAILURE);
+                }
+                close(fd[1]); // Close after dup2 to avoid leaking fds
+            }
+
+            // Execute the command
+            char *args[MAX_ARGS];
+            int arg_count = 0;
+            char *token = strtok(commands[i], " ");
+            while (token != NULL && arg_count < MAX_ARGS - 1) {
+                args[arg_count++] = token;
+                token = strtok(NULL, " ");
+            }
+            args[arg_count] = NULL; // Null-terminate the argument list
+
+            execvp(args[0], args);
+            // Only reached if execvp fails
+            perror("execvp failed");
+            exit(EXIT_FAILURE);
+        } else { // Parent process
+            // Close the previous input file descriptor that's not needed anymore
+            if (in_fd != STDIN_FILENO) {
+                close(in_fd);
+            }
+
+            // For all but the last command, prepare the input descriptor for the next child
+            if (i < num_commands - 1) {
+                in_fd = fd[0]; // Save the read end to use as input for the next command
+                close(fd[1]); // Close the write end; parent doesn't write
+            }
+        }
+    }
+
+    // Wait for all child processes to complete
+    while (wait(NULL) > 0);
+
+    return 0;
+}
+
+
+
+
+int main() {
+    char line[MAX_LINE];
+
+    while (1) {
+        printf("sish> ");
+        fflush(stdout);
+
+        if (fgets(line, MAX_LINE, stdin) == NULL) {
+            perror("fgets");
+            exit(1);
+        }
+
+        line[strcspn(line, "\n")] = '\0'; // Remove trailing newline
+
+        // Check for the presence of a pipe
+        if (strchr(line, '|')) {
+            // Handle piped commands
+            char *pipe_segments[MAX_ARGS];
+            int segment_count = 0;
+            pipe_segments[segment_count++] = strtok(line, "|");
+            while ((pipe_segments[segment_count++] = strtok(NULL, "|")) != NULL && segment_count < MAX_ARGS);
+
+            execute_piped_commands(pipe_segments, segment_count - 1);
+        } else {
+            // Handle a simple command
+            char *args[MAX_ARGS];
+            int arg_count = 0;
+            args[arg_count++] = strtok(line, " ");
+            while ((args[arg_count++] = strtok(NULL, " ")) != NULL) {
+                if (arg_count >= MAX_ARGS) {
+                    fprintf(stderr, "Too many arguments\n");
+                    arg_count--;
+                    break;
+                }
+            }
+
+            pid_t pid = fork();
+            if (pid < 0) {
+                perror("fork");
+                exit(1);
+            } else if (pid == 0) {
+                // Child process
+                if (execvp(args[0], args) < 0) {
+                    perror("execvp");
+                    exit(1);
+                }
+            } else {
+                // Parent process
+                wait(NULL);  // Wait for child to finish
+            }
+        }
+    }
+
+    return 0;
+}
